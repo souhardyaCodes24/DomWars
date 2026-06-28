@@ -1,17 +1,18 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { useGameStore } from '../store/gameStore';
 
-const RTC_CONFIG: RTCConfiguration = {
+const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:openrelay.metered.ca:80' },
+    { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
     { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   ],
-};
+} satisfies RTCConfiguration;
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3001/ws';
 const API_URL = import.meta.env.VITE_API_URL || '';
-const HANDSHAKE_TIMEOUT = 10000;
+const HANDSHAKE_TIMEOUT = 15000;
 
 interface WebRTCState {
   roomId: string | null;
@@ -42,6 +43,7 @@ export function useWebRTC() {
   const dcRef = useRef<RTCDataChannel | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const handshakeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
   const clearHandshakeTimer = useCallback(() => {
     if (handshakeTimerRef.current) {
@@ -119,6 +121,29 @@ export function useWebRTC() {
     }, HANDSHAKE_TIMEOUT);
   }, []);
 
+  function handleIceCandidate(msg: any) {
+    const pc = pcRef.current;
+    if (!pc) return;
+    const candidate = JSON.parse(msg.candidate);
+    if (pc.remoteDescription === null) {
+      pendingCandidatesRef.current.push(candidate);
+    } else {
+      pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+    }
+  }
+
+  async function drainPendingCandidates() {
+    const pc = pcRef.current;
+    if (!pc) return;
+    const candidates = pendingCandidatesRef.current;
+    pendingCandidatesRef.current = [];
+    for (const c of candidates) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(c));
+      } catch { /* ignore stale candidates */ }
+    }
+  }
+
   // ─── Host: create room ───────────────────────────
 
   const createRoom = useCallback(async () => {
@@ -133,6 +158,7 @@ export function useWebRTC() {
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
+      pendingCandidatesRef.current = [];
 
       const dc = pc.createDataChannel('game');
       setupDataChannel(dc);
@@ -155,10 +181,11 @@ export function useWebRTC() {
             ws.send(JSON.stringify({ type: 'offer', sdp: JSON.stringify(offer) }));
           }
           if (msg.type === 'answer' && msg.sdp && pc.signalingState !== 'stable') {
-            pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.sdp))).catch(() => {});
+            await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.sdp)));
+            await drainPendingCandidates();
           }
           if (msg.type === 'ice' && msg.candidate) {
-            pc.addIceCandidate(new RTCIceCandidate(JSON.parse(msg.candidate))).catch(() => {});
+            handleIceCandidate(msg);
           }
           if (msg.type === 'peer_disconnected') {
             handlePeerDisconnected();
@@ -188,6 +215,7 @@ export function useWebRTC() {
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
+      pendingCandidatesRef.current = [];
 
       pc.ondatachannel = (event) => {
         setupDataChannel(event.channel);
@@ -208,9 +236,10 @@ export function useWebRTC() {
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             ws.send(JSON.stringify({ type: 'answer', sdp: JSON.stringify(answer) }));
+            await drainPendingCandidates();
           }
           if (msg.type === 'ice' && msg.candidate) {
-            pc.addIceCandidate(new RTCIceCandidate(JSON.parse(msg.candidate))).catch(() => {});
+            handleIceCandidate(msg);
           }
           if (msg.type === 'peer_disconnected') {
             handlePeerDisconnected();
